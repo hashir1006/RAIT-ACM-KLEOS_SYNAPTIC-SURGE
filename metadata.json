@@ -1,0 +1,6 @@
+{
+  "name": "GST Mitra AI",
+  "description": "AI-powered GST Compliance, Invoice Intelligence, and ITC Recovery Assistant for Indian MSMEs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

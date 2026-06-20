@@ -1,0 +1,196 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+// Increase payload bounds for base64 file uploads (PDF & images)
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ limit: "25mb", extended: true }));
+
+let aiClient: GoogleGenAI | null = null;
+
+// Lazy initialization of GoogleGenAI to ensure structural robustness
+function getGeminiClient(): GoogleGenAI {
+  if (!aiClient) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY is not defined. Please configure secrets in the Settings > Secrets panel.");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+  }
+  return aiClient;
+}
+
+// 1. Health Status check
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// 2. AI OCR Extraction Engine using gemini-3.5-flash
+app.post("/api/ocr", async (req, res) => {
+  try {
+    const { base64Data, mimeType } = req.body;
+    if (!base64Data || !mimeType) {
+      return res.status(400).json({ error: "Missing invoice base64Data or mimeType" });
+    }
+
+    const client = getGeminiClient();
+
+    const filePart = {
+      inlineData: {
+        mimeType: mimeType,
+        data: base64Data
+      }
+    };
+
+    const textPart = {
+      text: "Perform zero-shot high-accuracy Indian GST Invoice OCR. Analyze fields, calculate CGST (Central Tax), SGST (State/UT Tax), and IGST (Integrated Tax). Sum CGST+SGST or find IGST based on location / GSTIN prefixes. Return JSON data formatted precisely using responseSchema."
+    };
+
+    const response = await client.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: { parts: [filePart, textPart] },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            invoice_number: { type: Type.STRING, description: "Extracted bill or invoice receipt number. If not found, use a plausible fallback." },
+            invoice_date: { type: Type.STRING, description: "Invoice registration date in YYYY-MM-DD format." },
+            supplier_name: { type: Type.STRING, description: "Merchant / suppliers trading name." },
+            supplier_gstin: { type: Type.STRING, description: "15-character Supplier GST Identification Number." },
+            buyer_gstin: { type: Type.STRING, description: "15-character Buyer GST Identification Number." },
+            hsn_code: { type: Type.STRING, description: "Primary HSN (Harmonized System of Nomenclature) Code." },
+            taxable_amount: { type: Type.NUMBER, description: "Taxable subtotal representation before GST." },
+            cgst: { type: Type.NUMBER, description: "Central tax value. Use 0 if IGST is active." },
+            sgst: { type: Type.NUMBER, description: "State tax value. Use 0 if IGST is active." },
+            igst: { type: Type.NUMBER, description: "Integrated tax value." },
+            total_gst: { type: Type.NUMBER, description: "Total CGST+SGST or IGST value." },
+            grand_total: { type: Type.NUMBER, description: "Grand total sum including GST." }
+          },
+          required: [
+            "invoice_number", "invoice_date", "supplier_name", "supplier_gstin",
+            "buyer_gstin", "hsn_code", "taxable_amount", "cgst", "sgst", "igst",
+            "total_gst", "grand_total"
+          ]
+        }
+      }
+    });
+
+    const parsedOutput = JSON.parse((response.text || "{}").trim());
+    return res.json(parsedOutput);
+  } catch (error: any) {
+    console.error("AI OCR backend execution error:", error);
+    return res.status(500).json({ error: error.message || "Failed to process AI OCR." });
+  }
+});
+
+// 3. Context-Aware GST Assistant chatbot with rigid topic boundaries
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { message, history, context } = req.body;
+    if (!message) {
+      return res.status(400).json({ error: "Missing message payload" });
+    }
+
+    const lowercaseMsg = message.toLowerCase();
+    
+    // Direct early filter for absolutely off-topic topics to enforce block mandates
+    const flagList = ["cricket", "football", "ipl", "politics", "election", "modi", "rahul gandhi", "coding", "javascript", "typescript", "c++", "python", "medical", "cancer", "recipe", "cooking", "bollywood", "hollywood", "actor"];
+    const hasViolation = flagList.some(flag => lowercaseMsg.includes(flag) && !lowercaseMsg.includes("gst") && !lowercaseMsg.includes("tax") && !lowercaseMsg.includes("invoice"));
+    
+    if (hasViolation) {
+      return res.json({
+        text: "I am GST Mitra AI. I can only assist with GST, ITC, Invoices, GSTR-2B, Compliance, Reports, and Platform Guidance."
+      });
+    }
+
+    const client = getGeminiClient();
+
+    const systemInstruction = `You are GST Mitra AI, an elite Chartered Accountant (CA) bot serving small shop owners, merchants, and MSMEs in India.
+    
+    STRICT COMPLIANCE DIRECTIVE:
+    - You must ONLY answer queries directly concerning Indian Goods and Services Tax (GST), goods categories, HSN classification, Input Tax Credit (ITC), GSTR-1 & GSTR-2B reconciliation parameters, and platform workflows.
+    - If a user asks about unrelated topics (e.g., sports, general medical advice, software development, general kitchen recipes, non-GST calculation, politics), you MUST answer exactly and solely with:
+      'I am GST Mitra AI. I can only assist with GST, ITC, Invoices, GSTR-2B, Compliance, Reports, and Platform Guidance.'
+    - Do NOT write software code or list generic code snippets.
+
+    CONTEXT AWARENESS INTEGRATION:
+    You have direct secure access to the merchant's real business status. Use this data contextually to answer questions about their personal status (e.g. 'How much ITC is blocked?', 'Tell me about my reports', etc.):
+    Current Profile: ${JSON.stringify(context?.profile || {})}
+    Merchant's Invoices: ${JSON.stringify(context?.invoices || [])}
+    GSTR-2B upload: ${JSON.stringify(context?.gstr2b || [])}
+    Mismatches/Recon analytics: ${JSON.stringify(context?.reconciliation || [])}
+
+    Write the final answer clearly with bullet points. Support multilingual terms. If the user asks in Hindi, Bengali, or Marathi, match their language style using friendly, layman-accessible explanation. Explain like a comforting, smart local CA!`;
+
+    const chatHistory = history ? history.map((chatUnit: any) => ({
+      role: chatUnit.sender === 'user' ? 'user' : 'model',
+      parts: [{ text: chatUnit.message }]
+    })) : [];
+
+    const contents = [...chatHistory, { role: 'user', parts: [{ text: message }] }];
+
+    const result = await client.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: contents,
+      config: {
+        systemInstruction: systemInstruction,
+        temperature: 0.35,
+      }
+    });
+
+    const aiResponseText = result.text || "I am GST Mitra AI. How can I assist you with GST, invoices, or GSTR-2B today?";
+    
+    // Simple double-check for safety
+    const resLower = aiResponseText.toLowerCase();
+    if (resLower.includes("coding") || resLower.includes("javascript") || resLower.includes("python") || resLower.includes("html")) {
+      if (!resLower.includes("gst") && !resLower.includes("tax")) {
+        return res.json({
+          text: "I am GST Mitra AI. I can only assist with GST, ITC, Invoices, GSTR-2B, Compliance, Reports, and Platform Guidance."
+        });
+      }
+    }
+
+    return res.json({ text: aiResponseText });
+  } catch (error: any) {
+    console.error("CA Assistant backend execution error:", error);
+    return res.status(500).json({ error: error.message || "Failed to compile AI response." });
+  }
+});
+
+// Serve Vite dev server or static distribution build based on environment mode
+async function serveApp() {
+  if (process.env.NODE_ENV !== "production") {
+    const viteInstance = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa"
+    });
+    app.use(viteInstance.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`GST Mitra AI full-stack server is active at http://localhost:${PORT}`);
+  });
+}
+
+serveApp();
